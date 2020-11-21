@@ -3,37 +3,42 @@
 #include <PubSubClient.h>
 
 // Hardware GPIO pins
-#define PIN_LED_1 2
-#define PIN_LED_2 0
+#define PIN_LED 2
+
+// Pin connecting the tone detector (bluepill/STM32F103)
 #define PIN_DETECTOR 5
+
+// Motor driver
 #define PIN_ACTUATOR_A 14
 #define PIN_ACTUATOR_B 12
 #define PIN_ACTUATOR_EN 13
 
-#define WIFI_SSID "a"
-#define WIFI_PASSWORD "a"
-
-#define MQTT_SERVER "192.168.111.10"
+// Network
+#define WIFI_SSID "yourwifi"
+#define WIFI_PASSWORD "password"
+#define MQTT_SERVER "192.168.82.10"
 #define MQTT_USER "guest"
 #define MQTT_PASSWORD "guest"
 
-// Event to dispatch when the dishwasher finished
-#define MQTT_TOPIC_FINISHED "home.dishwasher/evt.finished"
+// Event to dispatch when the dishwasher has finished
+#define MQTT_TOPIC_FINISHED "home.dishwasher/finished"
+#define MQTT_TOPIC_BEEPED "home.dishwasher/beeped"
 
-// Commands to force open/retract the actuator
+// Command to force the actuator open
 #define MQTT_TOPIC_OPEN "home.dishwasher/cmd.open"
-#define MQTT_TOPIC_RETRACT "home.dishwasher/cmd.retract"
 
 int detector_count = 0;
 int recent_detection_event_count = 0;
 unsigned long millis_at_last_detection = 0;
 unsigned long millis_at_opening_start = 0;
+unsigned long millis_at_dead_time_start = 0;
 unsigned long millis_at_retracting_start = 0;
 
 enum states {
   state_listening,
   state_opening,
-  state_retracting,
+  state_dead_time,
+  state_retracting
 };
 
 int state = state_listening;
@@ -43,7 +48,7 @@ WiFiClient esp_client;
 PubSubClient mqtt_client(esp_client);
 
 void mqtt_callback(char *topic, const byte *payload, unsigned int length) {
-    int i;
+    unsigned int i;
 
     for (i = 0; i < length; i++) {
         message_buff[i] = payload[i];
@@ -54,10 +59,6 @@ void mqtt_callback(char *topic, const byte *payload, unsigned int length) {
 
     if (strcmp(topic, MQTT_TOPIC_OPEN) == 0) {
         state = state_opening;
-    }
-
-    if (strcmp(topic, MQTT_TOPIC_RETRACT) == 0) {
-        state = state_retracting;
     }
 }
 
@@ -72,7 +73,7 @@ void setup_wifi() {
 
     while (WiFi.status() != WL_CONNECTED) {
         delay(100);
-        digitalWrite(PIN_LED_1, !digitalRead(PIN_LED_1));
+        digitalWrite(PIN_LED, !digitalRead(PIN_LED));
         Serial.print(".");
     }
 
@@ -84,12 +85,11 @@ void reconnect() {
     while (!mqtt_client.connected()) {
         Serial.print("Connecting to MQTT broker...");
         if (mqtt_client.connect("dishwasher", MQTT_USER, MQTT_PASSWORD)) {
-            digitalWrite(PIN_LED_1, LOW);
+            digitalWrite(PIN_LED, LOW);
             Serial.println("OK");
-            mqtt_client.subscribe(MQTT_TOPIC_RETRACT);
             mqtt_client.subscribe(MQTT_TOPIC_OPEN);
         } else {
-            digitalWrite(PIN_LED_1, HIGH);
+            digitalWrite(PIN_LED, HIGH);
             Serial.print("FAILED: ");
             Serial.print(mqtt_client.state());
             Serial.println(" Retrying...");
@@ -102,9 +102,8 @@ void listen() {
         detector_count++;
         if (detector_count > 500) {
             unsigned long elapsed_millis = millis() - millis_at_last_detection;
+            mqtt_client.publish(MQTT_TOPIC_BEEPED, "beep");
             Serial.print("detected: ");
-            Serial.println(detector_count);
-            Serial.print("    elapsed: ");
             Serial.println(elapsed_millis);
             detector_count = 0;
             if (elapsed_millis > 5000 && elapsed_millis < 7000) {
@@ -127,9 +126,10 @@ void listen() {
         }
     }
 
-    if (recent_detection_event_count > 3) {
+    if (recent_detection_event_count >= 3) {
         state = state_opening;
         recent_detection_event_count = 0;
+        mqtt_client.publish(MQTT_TOPIC_FINISHED, "finished");
     }
 }
 
@@ -145,8 +145,8 @@ void update_actuator() {
             digitalWrite(PIN_ACTUATOR_A, HIGH);
             digitalWrite(PIN_ACTUATOR_B, LOW);
             break;
+        case state_dead_time:
         default:
-            listen();
             digitalWrite(PIN_ACTUATOR_EN, LOW);
             digitalWrite(PIN_ACTUATOR_A, LOW);
             digitalWrite(PIN_ACTUATOR_B, LOW);
@@ -161,24 +161,25 @@ void print_state() {
         case state_opening:
             Serial.println("state_opening");
             break;
+        case state_dead_time:
+            Serial.println("state_dead_time");
+            break;
         case state_retracting:
             Serial.println("state_retracting");
             break;
         default:
-            Serial.println("state_?");
+            Serial.println("state_????????");
     }
 }
 
 void setup() {
-    pinMode(PIN_LED_1, OUTPUT);
-    pinMode(PIN_LED_2, OUTPUT);
+    pinMode(PIN_LED, OUTPUT);
     pinMode(PIN_ACTUATOR_A, OUTPUT);
     pinMode(PIN_ACTUATOR_B, OUTPUT);
     pinMode(PIN_ACTUATOR_EN, OUTPUT);
     pinMode(PIN_DETECTOR, INPUT);
 
-    digitalWrite(PIN_LED_1, HIGH);
-    digitalWrite(PIN_LED_2, LOW);
+    digitalWrite(PIN_LED, HIGH);
 
     Serial.begin(9600);
 
@@ -194,10 +195,8 @@ void loop() {
     if (!mqtt_client.connected()) {
         reconnect();
     }
-    mqtt_client.loop();
 
     delay(1);
-
     int previous_state = state;
 
     switch (state) {
@@ -205,16 +204,23 @@ void loop() {
             listen();
             break;
         case state_opening:
-            if (millis() - millis_at_opening_start > 5000) {
+            if (millis() - millis_at_opening_start > 8500) {
+                state = state_dead_time;
+            }
+            break;
+        case state_dead_time:
+            if (millis() - millis_at_dead_time_start > 1000) {
                 state = state_retracting;
             }
             break;
         case state_retracting:
-            if (millis() - millis_at_retracting_start > 10000) {
+            if (millis() - millis_at_retracting_start > 12000) {
                 state = state_listening;
             }
             break;
     }
+
+    mqtt_client.loop();
 
     if (previous_state != state) {
         update_actuator();
@@ -225,6 +231,8 @@ void loop() {
         if (state == state_retracting) {
             millis_at_retracting_start = millis();
         }
+        if (state == state_dead_time) {
+            millis_at_dead_time_start = millis();
+        }
     }
-
 }
